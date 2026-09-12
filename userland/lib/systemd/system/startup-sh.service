@@ -1,0 +1,10 @@
+[Unit]
+Description=Startup.sh Service
+After=multi-user.target
+
+[Service]
+Type=idle
+ExecStart=/home/anykey/startup.sh
+
+[Install]
+WantedBy=multi-user.target
