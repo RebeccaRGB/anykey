@@ -55,6 +55,9 @@ class Keyboard():
 	def read(self, timeout=None):
 		return self.iface[0].read(8, timeout)
 
+	def set_leds(self, leds):
+		self.device.ctrl_transfer(0x21, 0x09, 0x0200, self.iface.index, bytes([leds]))
+
 devices = usb.core.find(find_all=True, custom_match=isBootKeyboard)
 keyboards = [Keyboard(device) for device in devices]
 
@@ -63,6 +66,7 @@ for i in range(len(keyboards)):
 
 for k in keyboards:
 	k.claim()
+	k.set_leds(0x07)
 
 def readKeyboard(i, k, stopper):
 	while not stopper.is_set():
@@ -73,10 +77,23 @@ def readKeyboard(i, k, stopper):
 		except usb.core.USBTimeoutError:
 			continue
 
+def writeKeyboard(k, stopper):
+	while not stopper.is_set():
+		k.set_leds(0x01)
+		time.sleep(0.3)
+		k.set_leds(0x02)
+		time.sleep(0.3)
+		k.set_leds(0x04)
+		time.sleep(0.3)
+
 stoppers = [threading.Event() for k in keyboards]
 threads = [threading.Thread(target=readKeyboard, args=(i, keyboards[i], stoppers[i])) for i in range(len(keyboards))]
+wthreads = [threading.Thread(target=writeKeyboard, args=(keyboards[i], stoppers[i])) for i in range(len(keyboards))]
 
 for t in threads:
+	t.start()
+
+for t in wthreads:
 	t.start()
 
 while True:
@@ -93,5 +110,9 @@ for s in stoppers:
 for t in threads:
 	t.join()
 
+for t in wthreads:
+	t.join()
+
 for k in keyboards:
+	k.set_leds(0)
 	k.release()

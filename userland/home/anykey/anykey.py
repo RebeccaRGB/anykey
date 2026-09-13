@@ -191,10 +191,31 @@ class Keyboard():
 	def read(self, timeout=None):
 		return self.iface[0].read(8, timeout)
 
+	def set_leds(self, leds):
+		self.device.ctrl_transfer(0x21, 0x09, 0x0200, self.iface.index, bytes([leds]))
+
+# =================================== MAIN =================================== #
 
 font = PIL.ImageFont.load('sixenate.pil')
 display = BonnetDisplay(128, 64)
 buttons = BonnetButtons()
+
+def menu_display(items, index, noItems='No items.'):
+	display.clear()
+	y = (display.height - 8) // 2
+	if items:
+		display.draw.rectangle((0, y, display.width-1, y + 7), outline=1, fill=1)
+		display.draw.text((0, y), items[index], fill=0, font=font)
+		for i in range(len(items)):
+			if i != index:
+				y = (display.height - 8) // 2 + (i - index) * 8
+				if -8 < y < display.height:
+					display.draw.text((0, y), items[i], fill=1, font=font)
+	else:
+		display.draw.text((0, y), noItems, fill=1, font=font)
+	display.show()
+
+# --------------------------- USB Keyboard Monitor --------------------------- #
 
 def keeb_display_input_report_modifiers(mods):
 	display.draw.text((0, 0), '%02X' % mods, fill=1, font=font)
@@ -235,25 +256,246 @@ def keeb_display_input_report(input_report, old_input_report=None):
 			display.draw.text((0, i*8), CODES_USB[input_report[i]], fill=1, font=font)
 	display.show()
 
-def keeb_display_input_report_thread(k, stopper):
+def keeb_display_leds(leds, index):
+	display.clear()
+	x = display.width - 24
+	for i, m, s in [(0,0x01,'Num Lock'), (1,0x02,'Caps Lock'),
+	                (2,0x04,'Scroll Lock'), (3,0x08,'Compose'),
+	                (4,0x10,'Kana'), (5,0x20,'0x20'),
+	                (6,0x40,'0x40'), (7,0x80,'0x80')]:
+		if i == index:
+			display.draw.rectangle((0, i*8, display.width-1, i*8+7), outline=1, fill=1)
+		s2 = (' On' if (leds & m) else 'Off')
+		fill = (0 if (i == index) else 1)
+		display.draw.text((0, i*8), s, fill=fill, font=font)
+		display.draw.text((x, i*8), s2, fill=fill, font=font)
+	display.show()
+
+class KeyboardTask():
+	def activate(self):
+		pass
+	def button_event(self, button):
+		pass
+	def input_event(self, input_report):
+		pass
+	def suspend(self):
+		pass
+
+class KeyboardLiveTask(KeyboardTask):
+	def __init__(self):
+		self.active = False
+		self.input_report = b'\x00' * 8
+	def activate(self):
+		self.active = True
+		keeb_display_input_report(self.input_report)
+	def input_event(self, input_report):
+		if self.active:
+			keeb_display_input_report(input_report, self.input_report)
+		self.input_report = input_report
+	def suspend(self):
+		self.active = False
+		display.clear()
+		display.show()
+
+class KeyboardReportLogTask(KeyboardTask):
+	def __init__(self):
+		self.active = False
+		self.input_reports = []
+		self.strings = []
+		self.index = 0
+	def activate(self):
+		self.active = True
+		menu_display(self.strings, self.index, 'No reports.')
+	def button_event(self, button):
+		if button == BonnetButtons.UP:
+			if self.index > 0:
+				self.index -= 1
+				menu_display(self.strings, self.index, 'No reports.')
+			buttons.wait_for_release()
+		if button == BonnetButtons.DOWN:
+			if self.index < len(self.strings)-1:
+				self.index += 1
+				menu_display(self.strings, self.index, 'No reports.')
+			buttons.wait_for_release()
+		if button == BonnetButtons.A:
+			if self.input_reports:
+				self.active = False
+				keeb_display_input_report(self.input_reports[self.index])
+				time.sleep(0.1)
+				button = buttons.read()
+				while button:
+					if button & BonnetButtons.B:
+						self.input_reports = []
+						self.strings = []
+						self.index = 0
+						menu_display(self.strings, self.index, 'No reports.')
+						buttons.wait_for_release()
+						self.active = True
+						return
+					time.sleep(0.1)
+					button = buttons.read()
+				menu_display(self.strings, self.index, 'No reports.')
+				self.active = True
+			else:
+				buttons.wait_for_release()
+	def input_event(self, input_report):
+		follow = (self.index >= len(self.strings)-1)
+		self.input_reports.append(input_report)
+		self.strings.append(''.join('%02X' % b for b in input_report))
+		if follow:
+			self.index = len(self.strings)-1
+		if self.active:
+			menu_display(self.strings, self.index, 'No reports.')
+	def suspend(self):
+		self.active = False
+		display.clear()
+		display.show()
+
+class KeyboardEventLogTask(KeyboardTask):
+	def __init__(self):
+		self.active = False
+		self.input_report = b'\x00' * 8
+		self.strings = []
+		self.index = 0
+	def activate(self):
+		self.active = True
+		menu_display(self.strings, self.index, 'No events.')
+	def button_event(self, button):
+		if button == BonnetButtons.UP:
+			if self.index > 0:
+				self.index -= 1
+				menu_display(self.strings, self.index, 'No events.')
+			buttons.wait_for_release()
+		if button == BonnetButtons.DOWN:
+			if self.index < len(self.strings)-1:
+				self.index += 1
+				menu_display(self.strings, self.index, 'No events.')
+			buttons.wait_for_release()
+		if button == BonnetButtons.A:
+			time.sleep(0.1)
+			button = buttons.read()
+			while button:
+				if button & BonnetButtons.B:
+					self.strings = []
+					self.index = 0
+					menu_display(self.strings, self.index, 'No events.')
+					buttons.wait_for_release()
+					return
+				time.sleep(0.1)
+				button = buttons.read()
+	def input_event(self, input_report):
+		follow = (self.index >= len(self.strings)-1)
+		mods_pressed = input_report[0] &~ self.input_report[0]
+		mods_released = self.input_report[0] &~ input_report[0]
+		keys_pressed = [k for k in input_report[2:] if k and k not in self.input_report[2:]]
+		keys_released = [k for k in self.input_report[2:] if k and k not in input_report[2:]]
+		for m, k in [(0x01,0xE0),(0x02,0xE1),(0x04,0xE2),(0x08,0xE3),(0x10,0xE4),(0x20,0xE5),(0x40,0xE6),(0x80,0xE7)]:
+			if mods_released & m:
+				self.strings.append(CODES_USB[k][:2] + '\x19' + CODES_USB[k][3:])
+		for k in keys_released:
+			self.strings.append(CODES_USB[k][:2] + '\x19' + CODES_USB[k][3:])
+		for m, k in [(0x01,0xE0),(0x02,0xE1),(0x04,0xE2),(0x08,0xE3),(0x10,0xE4),(0x20,0xE5),(0x40,0xE6),(0x80,0xE7)]:
+			if mods_pressed & m:
+				self.strings.append(CODES_USB[k][:2] + '\x10' + CODES_USB[k][3:])
+		for k in keys_pressed:
+			self.strings.append(CODES_USB[k][:2] + '\x10' + CODES_USB[k][3:])
+		if follow:
+			self.index = len(self.strings)-1
+		if self.active:
+			menu_display(self.strings, self.index, 'No events.')
+		self.input_report = input_report
+	def suspend(self):
+		self.active = False
+		display.clear()
+		display.show()
+
+class KeyboardLEDTask(KeyboardTask):
+	def __init__(self, keyboard):
+		self.keyboard = keyboard
+		self.leds = 0
+		self.index = 0
+	def activate(self):
+		keeb_display_leds(self.leds, self.index)
+	def button_event(self, button):
+		if button == BonnetButtons.UP:
+			if self.index > 0:
+				self.index -= 1
+				keeb_display_leds(self.leds, self.index)
+			buttons.wait_for_release()
+		if button == BonnetButtons.DOWN:
+			if self.index < 7:
+				self.index += 1
+				keeb_display_leds(self.leds, self.index)
+			buttons.wait_for_release()
+		if button == BonnetButtons.A:
+			leds = self.leds ^ (1 << self.index)
+			try:
+				self.keyboard.set_leds(leds)
+				self.leds = leds
+				keeb_display_leds(self.leds, self.index)
+			except Exception:
+				traceback.print_exc()
+			buttons.wait_for_release()
+	def suspend(self):
+		display.clear()
+		display.show()
+
+class KeyboardMainTask(KeyboardTask):
+	def __init__(self, keyboard):
+		self.lock = threading.Lock()
+		self.active = False
+		self.subtasks = [KeyboardLiveTask(), KeyboardReportLogTask(), KeyboardEventLogTask(), KeyboardLEDTask(keyboard)]
+		self.index = 0
+	def activate(self):
+		with self.lock:
+			self.active = True
+			self.subtasks[self.index].activate()
+	def button_event(self, button):
+		with self.lock:
+			if button == BonnetButtons.LEFT:
+				self.subtasks[self.index].suspend()
+				self.index -= 1
+				if self.index < 0:
+					self.index += len(self.subtasks)
+				self.subtasks[self.index].activate()
+				buttons.wait_for_release()
+			elif button == BonnetButtons.RIGHT:
+				self.subtasks[self.index].suspend()
+				self.index += 1
+				if self.index >= len(self.subtasks):
+					self.index -= len(self.subtasks)
+				self.subtasks[self.index].activate()
+				buttons.wait_for_release()
+			elif button:
+				self.subtasks[self.index].button_event(button)
+	def input_event(self, input_report):
+		with self.lock:
+			for subtask in self.subtasks:
+				subtask.input_event(input_report)
+	def suspend(self):
+		with self.lock:
+			self.active = False
+			self.subtasks[self.index].suspend()
+
+def keeb_thread(k, task, stopper):
 	try:
 		k.claim()
-		old_input_report = b'\x00' * 8
-		keeb_display_input_report(old_input_report)
+		task.activate()
 		while not stopper.is_set():
 			try:
 				input_report = k.read(100)
-				keeb_display_input_report(input_report, old_input_report)
-				old_input_report = input_report
+				task.input_event(input_report)
 			except usb.core.USBTimeoutError:
 				continue
+		task.suspend()
 		k.release()
 	except Exception:
 		traceback.print_exc()
 
 def keeb_run(k):
+	task = KeyboardMainTask(k)
 	stopper = threading.Event()
-	thread = threading.Thread(target=keeb_display_input_report_thread, args=(k, stopper))
+	thread = threading.Thread(target=keeb_thread, args=(k, task, stopper))
 	thread.start()
 	while thread.is_alive():
 		b = buttons.read()
@@ -262,8 +504,12 @@ def keeb_run(k):
 			stopper.set()
 			thread.join()
 			break
+		elif b:
+			task.button_event(b)
 	display.clear()
 	display.show()
+
+# ---------------------------- USB Keyboard Menu ----------------------------- #
 
 def keeblist_display_keeb(y, k, fill=1):
 	display.draw.text((0, y), k.id_string(), fill=fill, font=font)
@@ -321,7 +567,7 @@ def keeblist_run():
 				index += 1
 				keeblist_display(keyboards, index)
 			buttons.wait_for_release()
-		if b in [BonnetButtons.LEFT, BonnetButtons.RIGHT, BonnetButtons.CENTER]:
+		if b == BonnetButtons.LEFT or b == BonnetButtons.RIGHT:
 			sel_id = keyboards[index].id_string() if keyboards else None
 			devices = usb.core.find(find_all=True, custom_match=isBootKeyboard)
 			keyboards = [Keyboard(device) for device in devices]
@@ -330,5 +576,7 @@ def keeblist_run():
 			buttons.wait_for_release()
 	display.clear()
 	display.show()
+
+# -------------------------------- Main Menu --------------------------------- #
 
 keeblist_run()
