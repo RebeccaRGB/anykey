@@ -2,6 +2,7 @@ import adafruit_ssd1306
 import board
 import busio
 import digitalio
+import os
 import PIL.Image
 import PIL.ImageDraw
 import PIL.ImageFont
@@ -12,6 +13,8 @@ import time
 import traceback
 import usb.core
 import usb.util
+
+# --------------------------- Adafruit OLED Bonnet --------------------------- #
 
 class BonnetDisplay():
 	def __init__(self, width, height):
@@ -86,6 +89,8 @@ class BonnetButtons():
 		time.sleep(0.1)
 		while self.read():
 			time.sleep(0.1)
+
+# --------------------------- USB Keyboard Driver ---------------------------- #
 
 CODES_USB = [
 	'00', '01 Roll Over', '02 POST Fail', '03 Undefined',
@@ -196,6 +201,79 @@ class Keyboard():
 	def set_leds(self, leds):
 		self.device.ctrl_transfer(0x21, 0x09, 0x0200, self.iface.index, bytes([leds]))
 
+# ------------------------------- USB Gadgets -------------------------------- #
+
+HID_KEYBOARD_REPORT_DESC = b'\x05\x01\x09\x06\xA1\x01\x05\x07\x19\xE0\x29\xE7\x15\x00\x25\x01\x75\x01\x95\x08\x81\x02\x95\x01\x75\x08\x81\x03\x95\x05\x75\x01\x05\x08\x19\x01\x29\x05\x91\x02\x95\x01\x75\x03\x91\x03\x95\x06\x75\x08\x15\x00\x25\x65\x05\x07\x19\x00\x29\x65\x81\x00\xC0'
+
+class USBGadget():
+	ROOT = '/sys/kernel/config/usb_gadget'
+
+	def __init__(self, name):
+		self.name = name
+		self.path = os.path.join(self.ROOT, name)
+
+	def mkdir(self, *args):
+		os.makedirs(os.path.join(self.path, *args), exist_ok=True)
+
+	def write(self, key, value, binary=False):
+		with open(os.path.join(self.path, key), 'wb' if binary else 'w') as f:
+			f.write(value)
+
+	def symlink(self, src, dst):
+		os.symlink(os.path.join(self.path, src), os.path.join(self.path, dst))
+
+	def remove(self, *args):
+		os.remove(os.path.join(self.path, *args))
+
+	def rmdir(self, *args):
+		os.rmdir(os.path.join(self.path, *args))
+
+	def create_device(self, idVendor, idProduct, serialnumber, manufacturer, product):
+		self.mkdir()
+		self.write('idVendor', '0x%04x' % idVendor)
+		self.write('idProduct', '0x%04x' % idProduct)
+		self.write('bcdDevice', '0x0100')
+		self.write('bcdUSB', '0x0200')
+		self.mkdir('strings/0x409')
+		self.write('strings/0x409/serialnumber', serialnumber)
+		self.write('strings/0x409/manufacturer', manufacturer)
+		self.write('strings/0x409/product', product)
+		self.mkdir('configs/c.1/strings/0x409')
+		self.write('configs/c.1/strings/0x409/configuration', 'Config 1: ECM network')
+		self.write('configs/c.1/MaxPower', '250')
+
+	def create_function(self, fname, protocol, subclass, report_length, report_desc):
+		self.mkdir('functions/%s' % fname)
+		self.write('functions/%s/protocol' % fname, str(protocol))
+		self.write('functions/%s/subclass' % fname, str(subclass))
+		self.write('functions/%s/report_length' % fname, str(report_length))
+		self.write('functions/%s/report_desc' % fname, report_desc, True)
+		self.symlink('functions/%s' % fname, 'configs/c.1/%s' % fname)
+
+	def activate(self):
+		self.write('UDC', '\n'.join(os.listdir('/sys/class/udc')))
+
+	def suspend(self):
+		self.write('UDC', '')
+
+	def destroy_function(self, fname):
+		self.remove('configs/c.1/%s' % fname)
+		self.rmdir('functions/%s' % fname)
+
+	def destroy_device(self):
+		self.rmdir('configs/c.1/strings/0x409')
+		self.rmdir('configs/c.1')
+		self.rmdir('strings/0x409')
+		self.rmdir()
+
+def hid_gadget_read(length):
+	with open('/dev/hidg0', 'rb') as f:
+		return f.read(length)
+
+def hid_gadget_write(input_report):
+	with open('/dev/hidg0', 'wb') as f:
+		f.write(input_report)
+
 # =================================== MAIN =================================== #
 
 font = PIL.ImageFont.load('sixenate.pil')
@@ -215,6 +293,22 @@ def menu_display(items, index, noItems='No items.'):
 					display.draw.text((0, y), items[i], fill=1, font=font)
 	else:
 		display.draw.text((0, y), noItems, fill=1, font=font)
+	display.show()
+
+def message_display(*message):
+	display.clear()
+	for i in range(len(message)):
+		y = (display.height - len(message) * 8) // 2 + i * 8
+		display.draw.text((0, y), message[i], fill=1, font=font)
+	display.show()
+
+def message_run(*message):
+	message_display(*message)
+	while True:
+		if buttons.read():
+			buttons.wait_for_release()
+			break
+	display.clear()
 	display.show()
 
 # --------------------------- USB Keyboard Monitor --------------------------- #
@@ -579,7 +673,173 @@ def keeblist_run():
 	display.clear()
 	display.show()
 
+# ----------------------------- USB Device Mode ------------------------------ #
+
+def anykey_display_leds(leds):
+	bx = display.width - 64
+	for x, m in [(0,0x01),(8,0x02),(16,0x04),(24,0x08),(32,0x10),(40,0x20),(48,0x40),(56,0x80)]:
+		display.draw.rectangle((bx+x+1, 9, bx+x+6, 14), outline=1, fill=(1 if (leds & m) else 0))
+
+def anykey_display(leds, mods, key, index):
+	display.clear()
+	# LEDs
+	display.draw.text((display.width - 64, 0), '1ASCK248', fill=1, font=font)
+	anykey_display_leds(leds)
+	# Any Key
+	y = (display.height - 8) // 2
+	if index == 0:
+		display.draw.rectangle((0, y, 7, y+7), outline=1, fill=1)
+		display.draw.text((0, y), CODES_USB[key][0], fill=0, font=font)
+		display.draw.text((8, y), CODES_USB[key][1:], fill=1, font=font)
+	elif index == 1:
+		display.draw.rectangle((0, y, display.width-1, y+7), outline=1, fill=1)
+		display.draw.text((0, y), CODES_USB[key], fill=0, font=font)
+	else:
+		display.draw.text((0, y), CODES_USB[key], fill=1, font=font)
+	# Modifiers
+	y = display.height - 16
+	for i, x, m, s in [(2,0,0x01,'\x06'),(3,8,0x02,'\x05'),(4,16,0x04,'\x07'),(5,24,0x08,'\x13'),
+	                   (6,-32,0x10,'\x06'),(7,-24,0x20,'\x05'),(8,-16,0x40,'\x07'),(9,-8,0x80,'\x13')]:
+		if x < 0:
+			x += display.width
+		if index == i:
+			display.draw.rectangle((x, y, x+7, y+7), outline=1, fill=1)
+			display.draw.text((x, y), s, fill=0, font=font)
+		else:
+			display.draw.text((x, y), s, fill=1, font=font)
+		display.draw.rectangle((x+1, y+9, x+6, y+14), outline=1, fill=(1 if (mods & m) else 0))
+	display.show()
+
+def anykey_write(mods, key):
+	try:
+		input_report = bytes([mods, 0, key, 0, 0, 0, 0, 0])
+		hid_gadget_write(input_report)
+	except Exception:
+		traceback.print_exc()
+
+class AnyKeyTask():
+	def __init__(self):
+		self.leds = 0
+		self.mods = 0
+		self.key = 0x28
+		self.index = 1
+		self.max_index = 9
+		self.display_lock = threading.Lock()
+	def activate(self):
+		with self.display_lock:
+			anykey_display(self.leds, self.mods, self.key, self.index)
+	def button_event(self, button):
+		if button == BonnetButtons.A:
+			anykey_write(self.mods, self.key)
+			buttons.wait_for_release()
+			anykey_write(self.mods, 0)
+		if button == BonnetButtons.LEFT:
+			with self.display_lock:
+				self.index -= 1
+				if self.index < 0:
+					self.index = self.max_index
+				anykey_display(self.leds, self.mods, self.key, self.index)
+			buttons.wait_for_release()
+		if button == BonnetButtons.RIGHT:
+			with self.display_lock:
+				self.index += 1
+				if self.index > self.max_index:
+					self.index = 0
+				anykey_display(self.leds, self.mods, self.key, self.index)
+			buttons.wait_for_release()
+		if button == BonnetButtons.UP:
+			with self.display_lock:
+				if self.index == 0:
+					self.key = (self.key + 0x10) & 0xFF
+				elif self.index == 1:
+					self.key = (self.key + 0x01) & 0xFF
+				else:
+					self.mods ^= (1 << (self.index - 2))
+					anykey_write(self.mods, 0)
+				anykey_display(self.leds, self.mods, self.key, self.index)
+			buttons.wait_for_release()
+		if button == BonnetButtons.DOWN:
+			with self.display_lock:
+				if self.index == 0:
+					self.key = (self.key - 0x10) & 0xFF
+				elif self.index == 1:
+					self.key = (self.key - 0x01) & 0xFF
+				else:
+					self.mods ^= (1 << (self.index - 2))
+					anykey_write(self.mods, 0)
+				anykey_display(self.leds, self.mods, self.key, self.index)
+			buttons.wait_for_release()
+	def led_event(self, leds):
+		with self.display_lock:
+			self.leds = leds
+			anykey_display_leds(leds)
+			display.show()
+	def suspend(self):
+		with self.display_lock:
+			display.clear()
+			display.show()
+
+def anykey_thread(task):
+	while True:
+		try:
+			data = hid_gadget_read(1)
+			task.led_event(data[0])
+		except Exception:
+			break
+
+def anykey_run():
+	try:
+		g = USBGadget('anykey')
+		g.create_device(0x1209, 0xF701, '', 'KreativeKorp', 'AnyKey')
+		g.create_function('hid.usb0', 1, 1, 8, HID_KEYBOARD_REPORT_DESC)
+		g.activate()
+		task = AnyKeyTask()
+		task.activate()
+		thread = threading.Thread(target=anykey_thread, args=(task,))
+		thread.start()
+		while True:
+			b = buttons.read()
+			if b == BonnetButtons.B:
+				buttons.wait_for_release()
+				break
+			elif b:
+				task.button_event(b)
+		g.suspend()
+		g.destroy_function('hid.usb0')
+		g.destroy_device()
+		task.suspend()
+		thread.join()
+	except Exception:
+		traceback.print_exc()
+	display.clear()
+	display.show()
+
 # -------------------------------- Main Menu --------------------------------- #
+
+def remove_lines(file, *removed_lines):
+	with open(file, 'r') as f:
+		lines = f.read().split('\n')
+	new_lines = [line for line in lines if line not in removed_lines]
+	with open(file, 'w') as f:
+		f.write('\n'.join(new_lines))
+
+def append_lines(file, *appended_lines):
+	with open(file, 'r') as f:
+		lines = f.read().split('\n')
+	new_lines = [line for line in lines if line not in appended_lines]
+	new_lines.extend(appended_lines)
+	with open(file, 'w') as f:
+		f.write('\n'.join(new_lines))
+
+def system_set_as_host():
+	remove_lines('/boot/firmware/config.txt', 'dtoverlay=dwc2')
+	remove_lines('/etc/modules', 'dwc2', 'libcomposite')
+	message_run('Set config for', 'USB host.', '', 'Restart to', 'take effect.')
+
+def system_set_as_device():
+	append_lines('/boot/firmware/config.txt', 'dtoverlay=dwc2')
+	append_lines('/etc/modules', 'dwc2', 'libcomposite')
+	message_run('Set config for', 'USB device.', '', 'Restart to', 'take effect.')
 
 def system_restart():
 	display.clear()
@@ -594,8 +854,22 @@ def system_shutdown():
 	sys.exit()
 
 def mainmenu_run():
-	items = ['USB Host Mode', 'Restart', 'Shut Down']
-	commands = [keeblist_run, system_restart, system_shutdown]
+	items = [
+		'USB Host Mode',
+		'USB Device Mode',
+		'Set as USB Host',
+		'Set as USB Dev',
+		'Restart',
+		'Shut Down'
+	]
+	commands = [
+		keeblist_run,
+		anykey_run,
+		system_set_as_host,
+		system_set_as_device,
+		system_restart,
+		system_shutdown
+	]
 	index = 0
 	menu_display(items, index)
 	while True:
