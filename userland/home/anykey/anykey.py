@@ -5,6 +5,8 @@ import digitalio
 import PIL.Image
 import PIL.ImageDraw
 import PIL.ImageFont
+import subprocess
+import sys
 import threading
 import time
 import traceback
@@ -579,4 +581,42 @@ def keeblist_run():
 
 # -------------------------------- Main Menu --------------------------------- #
 
-keeblist_run()
+def system_restart():
+	display.clear()
+	display.show()
+	subprocess.call(['shutdown', '-r', 'now'])
+	sys.exit()
+
+def system_shutdown():
+	display.clear()
+	display.show()
+	subprocess.call(['shutdown', '-h', 'now'])
+	sys.exit()
+
+def mainmenu_run():
+	items = ['USB Host Mode', 'Restart', 'Shut Down']
+	commands = [keeblist_run, system_restart, system_shutdown]
+	index = 0
+	menu_display(items, index)
+	while True:
+		b = buttons.read()
+		if b == BonnetButtons.A:
+			buttons.wait_for_release()
+			commands[index]()
+			menu_display(items, index)
+		if b == BonnetButtons.B:
+			index = len(items)-1
+			menu_display(items, index)
+			buttons.wait_for_release()
+		if b == BonnetButtons.UP:
+			if index > 0:
+				index -= 1
+				menu_display(items, index)
+			buttons.wait_for_release()
+		if b == BonnetButtons.DOWN:
+			if index < len(items)-1:
+				index += 1
+				menu_display(items, index)
+			buttons.wait_for_release()
+
+mainmenu_run()
